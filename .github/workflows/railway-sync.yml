@@ -1,0 +1,78 @@
+name: Railway Sync
+
+# Runs the Railway CLI on GitHub's runners (open internet) and commits the live
+# service logs + volume files into the repo, so they can be reviewed here even
+# though the Railway API is unreachable from some sandboxed environments.
+#
+# Setup (see starters/quant-research-loop/RAILWAY-ACCESS.md):
+#   - Secret  RAILWAY_TOKEN   : a Railway *project* token (Settings → Tokens)
+#   - Variable RAILWAY_SERVICE: the service name (e.g. loop-engineering). Optional
+#     but recommended if the project has more than one service.
+
+on:
+  schedule:
+    - cron: '30 */6 * * *'   # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: railway-sync
+  cancel-in-progress: false
+
+env:
+  RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+  SVC: ${{ vars.RAILWAY_SERVICE }}
+  OUT: starters/quant-research-loop/railway-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Pull logs + volume files (best-effort; never hard-fail)
+        run: |
+          set +e
+          mkdir -p "$OUT"
+          svc_flag=""; [ -n "$SVC" ] && svc_flag="--service $SVC"
+          stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          {
+            echo "# Railway sync — $stamp"
+            echo
+            echo "## whoami / status"
+            railway whoami 2>&1
+            railway status 2>&1
+          } > "$OUT/status.txt"
+
+          echo "Fetching last 400 deploy log lines..."
+          railway logs $svc_flag --lines 400 2>&1 > "$OUT/deploy-logs.txt"
+
+          echo "Listing volumes + files..."
+          railway volume list --json 2>&1 > "$OUT/volumes.json"
+          railway volume files list / $svc_flag --json 2>&1 > "$OUT/volume-files.json"
+
+          echo "Downloading volume state files (if present)..."
+          for f in scoreboard.json quant-forward-state.md quant-forward-log.md forward-registration.json; do
+            railway volume files download "/$f" "$OUT/$f" --overwrite $svc_flag 2>&1 \
+              || echo "(could not download /$f)" > "$OUT/$f.err"
+          done
+          echo "last_sync_utc: $stamp" > "$OUT/last-sync.txt"
+          set -e
+
+      - name: Commit synced Railway data
+        run: |
+          git config user.name "railway-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add "$OUT" || true
+          if git diff --cached --quiet; then
+            echo "No change in Railway data."
+          else
+            git commit -m "chore(quant): railway sync — logs + volume state [automated]"
+            git push
+          fi
